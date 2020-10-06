@@ -414,7 +414,8 @@ static __always_inline int reverse_map_l4_port(struct __ctx_buff *ctx, __u8 next
 static __always_inline int __lb6_rev_nat(struct __ctx_buff *ctx, int l4_off,
 					 struct csum_offset *csum_off,
 					 struct ipv6_ct_tuple *tuple, int flags,
-					 struct lb6_reverse_nat *nat)
+					 const struct lb6_reverse_nat *nat,
+					 const struct ct_state *ct_state)
 {
 	union v6addr old_saddr;
 	union v6addr tmp;
@@ -442,6 +443,27 @@ static __always_inline int __lb6_rev_nat(struct __ctx_buff *ctx, int l4_off,
 		new_saddr = tmp.addr;
 	}
 
+	if (ct_state->loopback) {
+		/* The packet was looped back to the sending endpoint on the
+		 * forward service translation.
+		 */
+		union v6addr old_daddr;
+
+		if (ipv6_load_daddr(ctx, ETH_HLEN, &old_daddr) < 0)
+			return DROP_INVALID;
+
+		cilium_dbg_lb(ctx, DBG_LB4_LOOPBACK_SNAT_REV, old_daddr.addr, old_saddr.addr);
+
+		ret = ipv6_store_daddr(ctx, &old_saddr, ETH_HLEN);
+		if (IS_ERR(ret))
+			return DROP_WRITE_ERROR;
+
+		sum = csum_diff(old_daddr.addr, 16, old_saddr.addr, 16, 0);
+
+		/* Update the tuple address which is representing the destination address */
+		ipv6_addr_copy(&tuple->saddr, &old_saddr);
+	}
+
 	ret = ipv6_store_saddr(ctx, new_saddr, ETH_HLEN);
 	if (IS_ERR(ret))
 		return DROP_WRITE_ERROR;
@@ -457,23 +479,24 @@ static __always_inline int __lb6_rev_nat(struct __ctx_buff *ctx, int l4_off,
  * @arg ctx		packet
  * @arg l4_off		offset to L4
  * @arg csum_off	offset to L4 checksum field
- * @arg csum_flags	checksum flags
  * @arg index		reverse NAT index
+ * @arg ct_state	conntrack state
  * @arg tuple		tuple
- * @arg saddr_tuple	If set, tuple address will be updated with new source address
+ * @arg flags		reverse NAT flags
  */
 static __always_inline int lb6_rev_nat(struct __ctx_buff *ctx, int l4_off,
-				       struct csum_offset *csum_off, __u16 index,
+				       struct csum_offset *csum_off,
+				       struct ct_state *ct_state,
 				       struct ipv6_ct_tuple *tuple, int flags)
 {
 	struct lb6_reverse_nat *nat;
 
-	cilium_dbg_lb(ctx, DBG_LB6_REVERSE_NAT_LOOKUP, index, 0);
-	nat = map_lookup_elem(&LB6_REVERSE_NAT_MAP, &index);
+	cilium_dbg_lb(ctx, DBG_LB6_REVERSE_NAT_LOOKUP, ct_state->rev_nat_index, 0);
+	nat = map_lookup_elem(&LB6_REVERSE_NAT_MAP, &ct_state->rev_nat_index);
 	if (nat == NULL)
 		return 0;
 
-	return __lb6_rev_nat(ctx, l4_off, csum_off, tuple, flags, nat);
+	return __lb6_rev_nat(ctx, l4_off, csum_off, tuple, flags, nat, ct_state);
 }
 
 /** Extract IPv6 LB key from packet
@@ -979,9 +1002,9 @@ static __always_inline int __lb4_rev_nat(struct __ctx_buff *ctx, int l3_off, int
  * @arg l3_off		offset to L3
  * @arg l4_off		offset to L4
  * @arg csum_off	offset to L4 checksum field
- * @arg csum_flags	checksum flags
- * @arg index		reverse NAT index
+ * @arg ct_state	conntrack state
  * @arg tuple		tuple
+ * @arg flags		reverse NAT flags
  */
 static __always_inline int lb4_rev_nat(struct __ctx_buff *ctx, int l3_off, int l4_off,
 				       struct csum_offset *csum_off,
